@@ -19,10 +19,24 @@ struct SessionRecord: Codable {
 
 struct IndexEntry {
     let sessionId: String
+    /// Claude's own auto-title, else the hook-written name, else the first thing you typed.
     let sessionName: String
     let cwd: String
     let startedAt: String
-    /// Lowercased session name + every summary bullet, flattened for keyword scoring.
+    /// Lowercased title + everything you typed in that session + any hook summary bullets.
+    let text: String
+}
+
+/// One transcript's parsed contents, kept on disk so the 222 MB of transcripts are only
+/// read once. A file is re-parsed only when its size or modification date changes.
+struct CachedTranscript: Codable {
+    let sessionId: String
+    let path: String
+    let modifiedAt: Double
+    let byteSize: Int
+    let title: String
+    let cwd: String
+    let startedAt: String
     let text: String
 }
 

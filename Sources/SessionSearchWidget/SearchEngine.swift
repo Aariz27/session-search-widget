@@ -3,10 +3,224 @@ import Foundation
 // MARK: - Index building
 
 enum SessionIndex {
-    /// Walks the index root and flattens every named session into one searchable entry.
-    static func build() -> [IndexEntry] {
-        let fileManager = FileManager.default
+    /// Everything you typed in one session, capped so a very long transcript cannot
+    /// dominate memory. 20k characters is roughly 3-4k words, plenty to match on.
+    private static let maxTextPerSession = 20_000
 
+    /// Text that Claude Code or my own hooks injected into the transcript rather than
+    /// text you actually typed. Indexing it would match every session on the same words.
+    private static let injectedPrefixes = [
+        "<command-name>",
+        "<local-command",
+        "<system-reminder",
+        "<user-prompt-submit-hook",
+        "caveat: the messages below",
+        "summarize this excerpt of a claude code session transcript",
+        "this session is being continued from a previous conversation",
+        "[request interrupted",
+        "api error",
+    ]
+
+    /// Builds the searchable list from every real Claude Code transcript on this machine,
+    /// then folds in the 3-bullet summaries the hooks write into each project's sessions.json.
+    static func build() -> [IndexEntry] {
+        let transcripts = loadTranscripts()
+        let summaries = loadHookSummaries()
+
+        return transcripts.map { transcript in
+            var title = transcript.title
+            var textParts = [title, transcript.text]
+
+            // A hook summary, when one exists, is the most accurate description of the
+            // session, so its name wins and its bullets get added to the searchable text.
+            if let summary = summaries[transcript.sessionId] {
+                if let name = summary.session_name, !name.isEmpty {
+                    title = name
+                    textParts.insert(name, at: 0)
+                }
+                for entry in summary.session_summary {
+                    textParts.append(contentsOf: entry.bullets)
+                }
+            }
+
+            return IndexEntry(
+                sessionId: transcript.sessionId,
+                sessionName: title,
+                cwd: transcript.cwd,
+                startedAt: transcript.startedAt,
+                text: textParts.joined(separator: " ").lowercased()
+            )
+        }
+        .sorted { $0.startedAt > $1.startedAt }
+    }
+
+    // MARK: Transcripts
+
+    /// Reads every `<uuid>.jsonl` under ~/.claude/projects, reusing the on-disk cache for
+    /// files that have not changed since the last run.
+    private static func loadTranscripts() -> [CachedTranscript] {
+        let fileManager = FileManager.default
+        let root: URL
+        if let overridePath = ProcessInfo.processInfo.environment["SSW_TRANSCRIPT_ROOT"], !overridePath.isEmpty {
+            root = URL(fileURLWithPath: overridePath, isDirectory: true)
+        } else {
+            root = fileManager.homeDirectoryForCurrentUser
+                .appendingPathComponent(".claude/projects", isDirectory: true)
+        }
+
+        var cache: [String: CachedTranscript] = [:]
+        if let data = try? Data(contentsOf: cacheURL),
+           let cached = try? JSONDecoder().decode([CachedTranscript].self, from: data) {
+            for entry in cached { cache[entry.sessionId] = entry }
+        }
+
+        guard let enumerator = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            return []
+        }
+
+        var results: [CachedTranscript] = []
+
+        for case let fileURL as URL in enumerator {
+            guard fileURL.pathExtension == "jsonl" else { continue }
+            let sessionId = fileURL.deletingPathExtension().lastPathComponent
+            guard isSessionId(sessionId) else { continue }
+
+            let values = try? fileURL.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            let modifiedAt = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
+            let byteSize = values?.fileSize ?? 0
+
+            if let hit = cache[sessionId], hit.modifiedAt == modifiedAt, hit.byteSize == byteSize {
+                results.append(hit)
+                continue
+            }
+
+            if let parsed = parseTranscript(at: fileURL, sessionId: sessionId, modifiedAt: modifiedAt, byteSize: byteSize) {
+                results.append(parsed)
+            }
+        }
+
+        if let data = try? JSONEncoder().encode(results) {
+            try? data.write(to: cacheURL)
+        }
+
+        return results
+    }
+
+    /// A session transcript is named after its UUID; subagent runs, skill-injections and
+    /// journals live in the same folders and must not appear as sessions you can resume.
+    private static func isSessionId(_ name: String) -> Bool {
+        let parts = name.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 5 else { return false }
+        let lengths = [8, 4, 4, 4, 12]
+        for (part, length) in zip(parts, lengths) {
+            guard part.count == length else { return false }
+            guard part.allSatisfy({ $0.isHexDigit }) else { return false }
+        }
+        return true
+    }
+
+    private static var cacheURL: URL {
+        SearchLog.programDir.appendingPathComponent("transcript-cache.json")
+    }
+
+    /// Walks one transcript line by line and keeps the title, the folder it ran in, the
+    /// start time and everything you typed.
+    private static func parseTranscript(at url: URL, sessionId: String, modifiedAt: Double, byteSize: Int) -> CachedTranscript? {
+        guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+
+        var aiTitle = ""
+        var cwd = ""
+        var startedAt = ""
+        var typedText = ""
+
+        for line in raw.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let lineData = line.data(using: .utf8) else { continue }
+            guard let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+            guard let type = object["type"] as? String else { continue }
+
+            if type == "ai-title", let value = object["aiTitle"] as? String, !value.isEmpty {
+                aiTitle = value
+                continue
+            }
+
+            guard type == "user" else { continue }
+            if object["isMeta"] as? Bool == true { continue }
+            if object["isSidechain"] as? Bool == true { continue }
+
+            if cwd.isEmpty, let value = object["cwd"] as? String { cwd = value }
+            if startedAt.isEmpty, let value = object["timestamp"] as? String { startedAt = value }
+
+            guard typedText.count < maxTextPerSession else { continue }
+            guard let message = object["message"] as? [String: Any] else { continue }
+            let text = userText(from: message["content"])
+            guard !text.isEmpty, !isInjected(text) else { continue }
+
+            typedText += text + " "
+        }
+
+        // A transcript with nothing you typed is a stub Claude Code left behind.
+        guard !typedText.isEmpty else { return nil }
+
+        if cwd.isEmpty {
+            cwd = FileManager.default.homeDirectoryForCurrentUser.path
+        }
+
+        let title = aiTitle.isEmpty ? firstLineTitle(from: typedText) : aiTitle
+
+        return CachedTranscript(
+            sessionId: sessionId,
+            path: url.path,
+            modifiedAt: modifiedAt,
+            byteSize: byteSize,
+            title: title,
+            cwd: cwd,
+            startedAt: startedAt,
+            text: String(typedText.prefix(maxTextPerSession))
+        )
+    }
+
+    /// A user message is either a plain string or a list of blocks; only the text blocks matter.
+    private static func userText(from content: Any?) -> String {
+        if let text = content as? String {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard let blocks = content as? [[String: Any]] else { return "" }
+        var pieces: [String] = []
+        for block in blocks where block["type"] as? String == "text" {
+            if let text = block["text"] as? String { pieces.append(text) }
+        }
+        return pieces.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func isInjected(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        for prefix in injectedPrefixes where lowered.hasPrefix(prefix) { return true }
+        return false
+    }
+
+    /// Falls back to the opening words you typed, which read well enough as a title.
+    private static func firstLineTitle(from text: String) -> String {
+        let cleaned = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard cleaned.count > 70 else { return cleaned }
+        let cut = cleaned.prefix(70)
+        if let lastSpace = cut.lastIndex(of: " ") {
+            return String(cut[cut.startIndex..<lastSpace]) + "…"
+        }
+        return String(cut) + "…"
+    }
+
+    // MARK: Hook summaries
+
+    /// Reads every sessions.json the hooks wrote under ~/Documents, keyed by session id.
+    /// Nothing here is written to; the hooks stay exactly as they are.
+    private static func loadHookSummaries() -> [String: SessionRecord] {
+        let fileManager = FileManager.default
         let root: URL
         if let overridePath = ProcessInfo.processInfo.environment["SSW_INDEX_ROOT"], !overridePath.isEmpty {
             root = URL(fileURLWithPath: overridePath, isDirectory: true)
@@ -14,44 +228,24 @@ enum SessionIndex {
             root = fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Documents", isDirectory: true)
         }
 
-        var entries: [IndexEntry] = []
+        var summaries: [String: SessionRecord] = [:]
 
         guard let enumerator = fileManager.enumerator(
             at: root,
             includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else {
-            return entries
+            return summaries
         }
 
         for case let fileURL as URL in enumerator {
             guard fileURL.lastPathComponent == "sessions.json" else { continue }
-
             guard let data = try? Data(contentsOf: fileURL) else { continue }
             guard let records = try? JSONDecoder().decode([SessionRecord].self, from: data) else { continue }
-
-            for record in records {
-                guard let sessionName = record.session_name, !sessionName.isEmpty else { continue }
-
-                var textParts: [String] = [sessionName]
-                for summary in record.session_summary {
-                    textParts.append(contentsOf: summary.bullets)
-                }
-                let text = textParts.joined(separator: " ").lowercased()
-
-                entries.append(
-                    IndexEntry(
-                        sessionId: record.session_id,
-                        sessionName: sessionName,
-                        cwd: record.cwd,
-                        startedAt: record.started_at,
-                        text: text
-                    )
-                )
-            }
+            for record in records { summaries[record.session_id] = record }
         }
 
-        return entries
+        return summaries
     }
 }
 
@@ -107,7 +301,9 @@ enum SessionSearch {
             let entry = scoredEntry.entry
             let projectName = (entry.cwd as NSString).lastPathComponent
             let snippet = makeSnippet(text: entry.text, tokens: tokens)
-            let command = "claude --resume \"\(entry.sessionName)\""
+            // Resume by session id, not by name: most transcripts have no hook-written
+            // name, and `claude --resume` takes the id directly.
+            let command = "claude --resume \(entry.sessionId)"
             return SearchResultRow(
                 sessionName: entry.sessionName,
                 projectName: projectName,
