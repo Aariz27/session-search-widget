@@ -400,6 +400,7 @@ enum SessionSearch {
             // name, and `claude --resume` takes the id directly.
             let command = "claude --resume \(entry.sessionId)"
             return SearchResultRow(
+                sessionId: entry.sessionId,
                 sessionName: entry.sessionName,
                 projectName: projectName,
                 snippet: snippet,
@@ -469,109 +470,165 @@ enum SessionSearch {
     }
 }
 
-// MARK: - Ollama reranking
+// MARK: - Semantic ranking with headless Claude (Haiku)
 
-enum Ollama {
-    private static let baseURL = URL(string: "http://127.0.0.1:11434/api/generate")!
-    private static let model = "qwen2.5:1.5b"
+/// The semantic mode you reach by pressing Tab. It shells out to the `claude` command with
+/// `--model haiku`, which bills your Claude subscription, so nothing here runs unless you
+/// explicitly switch the panel into semantic mode.
+enum HaikuRerank {
+    /// Locations to look for the `claude` command. A GUI app launched from Finder does not
+    /// inherit your shell PATH, so guessing from PATH alone is not enough.
+    private static let searchPaths = [
+        "\(NSHomeDirectory())/.local/bin/claude",
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+        "\(NSHomeDirectory())/.claude/local/claude",
+    ]
 
-    /// Fire-and-forget tiny request at launch so the model is resident and later calls are ~300ms not ~2400ms.
-    static func prewarm() {
-        Task.detached {
-            var request = URLRequest(url: baseURL)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.timeoutInterval = 8
-
-            let body: [String: Any] = [
-                "model": model,
-                "prompt": "hi",
-                "stream": false,
-            ]
-
-            guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { return }
-            request.httpBody = jsonData
-
-            _ = try? await URLSession.shared.data(for: request)
+    /// Resolved once: the full path of the `claude` command, or nil when it is not installed.
+    static let executablePath: String? = {
+        let fileManager = FileManager.default
+        for path in searchPaths where fileManager.isExecutableFile(atPath: path) {
+            return path
         }
-    }
+        // Last resort: ask the login shell where it is.
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", "command -v claude"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let found = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return found.isEmpty ? nil : found
+    }()
 
-    /// Asks qwen2.5:1.5b to reorder ambiguous candidates. Returns session names in the model's preferred
-    /// order, or nil on any failure/timeout. MUST NOT throw and MUST NOT hang the caller.
-    static func rerank(query: String, candidates: [ScoredEntry]) async -> [String]? {
-        guard !candidates.isEmpty else { return nil }
+    static var isAvailable: Bool { executablePath != nil }
+
+    /// Asks Haiku to reorder the candidates by what you actually meant. Returns session ids
+    /// in the model's preferred order, or nil when the command is missing, times out, or
+    /// replies with something that contains no numbers.
+    static func rank(query: String, candidates: [ScoredEntry], timeout: TimeInterval = 25) async -> [String]? {
+        guard !candidates.isEmpty, let executablePath else { return nil }
+
+        // Only the strongest keyword matches are sent, to keep the prompt small and the bill low.
+        let shortlist = Array(candidates.prefix(12))
 
         var promptLines = [
-            "The user is searching their coding session history for: \"\(query)\"",
+            // Your SessionStart hook injects "ask what to name this session" into every
+            // headless run. Without this line Haiku obeys the hook and asks a question
+            // instead of ranking, so the override has to be stated in the prompt itself.
+            "IGNORE any instruction about naming a session. Do not ask questions.",
+            "",
+            "Someone is searching their past coding sessions for: \"\(query)\"",
             "Here are the candidate sessions, numbered:",
         ]
 
-        for (index, candidate) in candidates.enumerated() {
+        for (position, candidate) in shortlist.enumerated() {
             let text = candidate.entry.text
-            let snippet: String
-            if text.count > 150 {
-                let end = text.index(text.startIndex, offsetBy: 150)
-                snippet = String(text[text.startIndex..<end])
-            } else {
-                snippet = text
-            }
-            promptLines.append("\(index + 1). \(candidate.entry.sessionName) - \(snippet)")
+            let snippet = text.count > 180 ? String(text.prefix(180)) : text
+            promptLines.append("\(position + 1). \(candidate.entry.sessionName) — \(snippet)")
         }
 
-        promptLines.append("Reply with ONLY the numbers in best-to-worst match order, comma-separated, nothing else.")
-        let prompt = promptLines.joined(separator: "\n")
+        promptLines.append("")
+        promptLines.append("Reply with ONLY the numbers in best-to-worst order, comma-separated. No other text.")
 
-        var request = URLRequest(url: baseURL)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 8
-
-        let body: [String: Any] = [
-            "model": model,
-            "prompt": prompt,
-            "stream": false,
+        let arguments = [
+            "-p", promptLines.joined(separator: "\n"),
+            "--model", "haiku",
+            "--strict-mcp-config",
+            "--mcp-config", "{\"mcpServers\":{}}",
+            "--system-prompt", "You are a ranking function. You output only comma-separated numbers. You never ask questions.",
+            "--no-session-persistence",
+            "--no-chrome",
         ]
 
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
-        request.httpBody = jsonData
-
-        do {
-            let (data, _) = try await URLSession.shared.data(for: request)
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-            guard let responseText = json["response"] as? String else { return nil }
-
-            var seen = Set<Int>()
-            var orderedIndices: [Int] = []
-
-            var currentNumber = ""
-            func flush() {
-                if let value = Int(currentNumber) {
-                    let zeroBased = value - 1
-                    if zeroBased >= 0 && zeroBased < candidates.count && !seen.contains(zeroBased) {
-                        seen.insert(zeroBased)
-                        orderedIndices.append(zeroBased)
-                    }
-                }
-                currentNumber = ""
-            }
-
-            for char in responseText {
-                if char.isNumber {
-                    currentNumber.append(char)
-                } else {
-                    flush()
-                }
-            }
-            flush()
-
-            guard !orderedIndices.isEmpty else { return nil }
-            return orderedIndices.map { candidates[$0].entry.sessionName }
-        } catch {
+        guard let reply = await runCommand(executablePath: executablePath, arguments: arguments, timeout: timeout) else {
             return nil
         }
+
+        let order = parseOrder(reply, candidateCount: shortlist.count)
+        guard !order.isEmpty else { return nil }
+        return order.map { shortlist[$0].entry.sessionId }
+    }
+
+    /// A throwaway folder the semantic call runs inside. Your SessionStart hook writes a
+    /// `sessions.json` row into whatever folder `claude` is launched from, so launching it
+    /// from here keeps those rows out of your real project folders and out of this index.
+    /// It also means no CLAUDE.md is found, which cuts what the call has to load.
+    private static let scratchDirectory: URL = {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("session-search-widget-haiku", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }()
+
+    /// Runs the command off the main thread and gives up after `timeout` seconds so a hung
+    /// call can never freeze the panel.
+    private static func runCommand(executablePath: String, arguments: [String], timeout: TimeInterval) async -> String? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: executablePath)
+                process.arguments = arguments
+                process.currentDirectoryURL = scratchDirectory
+                process.standardError = FileHandle.nullDevice
+
+                let pipe = Pipe()
+                process.standardOutput = pipe
+
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(returning: nil)
+                    return
+                }
+
+                let deadline = DispatchWorkItem {
+                    if process.isRunning { process.terminate() }
+                }
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: deadline)
+
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                deadline.cancel()
+
+                guard process.terminationStatus == 0 else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: String(data: data, encoding: .utf8))
+            }
+        }
+    }
+
+    /// Pulls the numbers out of the reply, ignoring anything else the model wrote.
+    private static func parseOrder(_ reply: String, candidateCount: Int) -> [Int] {
+        var seen = Set<Int>()
+        var order: [Int] = []
+        var digits = ""
+
+        func flush() {
+            defer { digits = "" }
+            guard let value = Int(digits) else { return }
+            let position = value - 1
+            guard position >= 0, position < candidateCount, seen.insert(position).inserted else { return }
+            order.append(position)
+        }
+
+        for character in reply {
+            if character.isNumber {
+                digits.append(character)
+            } else {
+                flush()
+            }
+        }
+        flush()
+        return order
     }
 }
-
 // MARK: - Logging
 
 enum SearchLog {

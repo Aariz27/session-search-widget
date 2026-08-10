@@ -14,19 +14,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentQuery = ""
     private var currentScored: [ScoredEntry] = []
     private var currentRows: [SearchResultRow] = []
-    private var lastSource = "instant_keyword"
+    private var lastSource = "local"
     private var lastDurationMs: Double = 0
-    private var rerankTimer: Timer?
-    private var rerankGeneration = 0
-
-    /// How long typing must pause before the local model is asked to reorder results.
-    private let rerankDelay: TimeInterval = 0.6
+    /// Bumped whenever the query or the mode changes, so a slow Haiku reply that arrives
+    /// after you have typed something else is thrown away instead of shown.
+    private var semanticGeneration = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
         index = SessionIndex.build()
-        Ollama.prewarm()
 
         controller = SpotlightController()
         controller.delegate = self
@@ -79,37 +76,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Runs the local model only when typing has paused and the keyword scores are ambiguous.
-    private func scheduleRerank(for query: String) {
-        rerankTimer?.invalidate()
-        rerankGeneration += 1
-        let generation = rerankGeneration
-        guard currentScored.count > 1, !SessionSearch.isClearWinner(currentScored) else { return }
+    /// Sends the current shortlist to Claude Haiku. Only ever called when you have put the
+    /// panel in semantic mode by pressing Tab, because this bills your Claude subscription.
+    private func runSemanticSearch(for query: String) {
+        semanticGeneration += 1
+        let generation = semanticGeneration
 
-        rerankTimer = Timer.scheduledTimer(withTimeInterval: rerankDelay, repeats: false) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, generation == self.rerankGeneration, self.controller.isVisible else { return }
-                let candidates = self.currentScored
-                self.controller.setSearching(true)
-                let start = Date()
-                let order = await Ollama.rerank(query: query, candidates: candidates)
-                guard generation == self.rerankGeneration else { return }
-                self.controller.setSearching(false)
-                guard let order, !order.isEmpty else { return }
+        guard !currentScored.isEmpty else { return }
+        guard HaikuRerank.isAvailable else {
+            controller.setStatus("the claude command was not found on this machine")
+            return
+        }
 
-                // Reorder existing rows to the model's preference; anything it omitted keeps its place at the end.
-                var byName: [String: SearchResultRow] = [:]
-                for row in self.currentRows { byName[row.sessionName] = row }
-                var reordered: [SearchResultRow] = []
-                for name in order { if let row = byName.removeValue(forKey: name) { reordered.append(row) } }
-                for row in self.currentRows where byName[row.sessionName] != nil { reordered.append(row) }
+        let candidates = currentScored
+        controller.setSearching(true)
+        controller.setStatus("asking Claude Haiku…")
+        let start = Date()
 
-                self.currentRows = reordered
-                self.lastSource = "qwen_rerank"
-                self.lastDurationMs = Date().timeIntervalSince(start) * 1000
-                self.controller.setRows(reordered)
-                self.controller.setStatus("\(reordered.count) results · \(Int(self.lastDurationMs))ms · model")
+        Task { @MainActor in
+            let order = await HaikuRerank.rank(query: query, candidates: candidates)
+            guard generation == self.semanticGeneration, self.controller.isVisible else { return }
+            self.controller.setSearching(false)
+
+            let elapsedMs = Date().timeIntervalSince(start) * 1000
+            guard let order, !order.isEmpty else {
+                self.lastSource = "semantic_failed"
+                self.lastDurationMs = elapsedMs
+                self.controller.setStatus("Claude Haiku did not answer · showing local matches")
+                return
             }
+
+            // Put the sessions Haiku chose at the top; anything it left out keeps its place below.
+            var byId: [String: SearchResultRow] = [:]
+            for row in self.currentRows { byId[row.sessionId] = row }
+            var reordered: [SearchResultRow] = []
+            for sessionId in order {
+                if let row = byId.removeValue(forKey: sessionId) { reordered.append(row) }
+            }
+            for row in self.currentRows where byId[row.sessionId] != nil { reordered.append(row) }
+
+            self.currentRows = reordered
+            self.lastSource = "semantic_haiku"
+            self.lastDurationMs = elapsedMs
+            self.controller.setRows(reordered)
+            self.controller.setStatus("\(reordered.count) results · \(Int(elapsedMs))ms · Claude Haiku")
         }
     }
 
@@ -129,28 +139,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 extension AppDelegate: SpotlightPanelDelegate {
     func spotlightQueryChanged(_ query: String) {
         currentQuery = query
+        // Any in-flight Haiku answer is now stale, whatever the new query is.
+        semanticGeneration += 1
+
         guard !query.trimmingCharacters(in: .whitespaces).isEmpty else {
             currentScored = []
             currentRows = []
             controller.setRows([])
             controller.setStatus("\(index.count) sessions indexed")
-            rerankTimer?.invalidate()
-            rerankGeneration += 1
             return
         }
 
+        runLocalSearch(query)
+
+        // Typing in semantic mode does not call Claude on every keystroke. You press
+        // Enter, or Tab again, when you want the paid search to run.
+        if controller.mode == .semantic, !currentRows.isEmpty {
+            controller.setStatus("\(currentRows.count) local matches · press Tab to rank with Claude Haiku")
+        }
+    }
+
+    /// The default search: match the words you typed against the indexed session text.
+    /// Runs entirely on this machine and costs nothing.
+    private func runLocalSearch(_ query: String) {
         let start = Date()
         currentScored = SessionSearch.rank(query: query, index: index)
         currentRows = SessionSearch.rows(from: currentScored, query: query)
         lastDurationMs = Date().timeIntervalSince(start) * 1000
-        lastSource = currentRows.isEmpty ? "no_match" : "instant_keyword"
+        lastSource = currentRows.isEmpty ? "no_match" : "local"
 
         controller.setRows(currentRows)
         controller.setStatus(currentRows.isEmpty
             ? "no matches"
-            : "\(currentRows.count) results · \(String(format: "%.1f", lastDurationMs))ms · keyword")
+            : "\(currentRows.count) results · \(String(format: "%.1f", lastDurationMs))ms · local")
+    }
 
-        scheduleRerank(for: query)
+    func spotlightModeToggled(to mode: SearchMode) {
+        switch mode {
+        case .local:
+            // Drop any Haiku answer still on its way and go back to the word matches.
+            semanticGeneration += 1
+            controller.setSearching(false)
+            guard !currentQuery.trimmingCharacters(in: .whitespaces).isEmpty else {
+                controller.setStatus("\(index.count) sessions indexed")
+                return
+            }
+            runLocalSearch(currentQuery)
+
+        case .semantic:
+            guard !currentQuery.trimmingCharacters(in: .whitespaces).isEmpty else {
+                controller.setStatus("type a query, then Tab ranks it with Claude Haiku")
+                return
+            }
+            runSemanticSearch(for: currentQuery)
+        }
     }
 
     func spotlightSubmitted(row: SearchResultRow, rank: Int) {
@@ -197,8 +239,7 @@ extension AppDelegate: SpotlightPanelDelegate {
     }
 
     func spotlightDismissed() {
-        rerankTimer?.invalidate()
-        rerankGeneration += 1
+        semanticGeneration += 1
         outsideClick.stop()
         if !currentQuery.isEmpty, let top = currentRows.first {
             SearchLog.logQuery(outcome(for: top, rank: nil))
@@ -212,28 +253,33 @@ extension AppDelegate: SpotlightPanelDelegate {
 
 // MARK: - Headless verification path
 
-/// `SessionSearchWidget --cli-test "query"` exercises index → rank → rerank → log with no GUI,
-/// so the search path can be tested without driving AppKit.
+/// `SessionSearchWidget --cli-test "query"` runs the local search with no GUI.
+/// Add `--semantic` to also send the shortlist to Claude Haiku, exactly as pressing Tab does.
 @MainActor
-func runCLITest(query: String) async {
+func runCLITest(query: String, semantic: Bool) async {
     let index = SessionIndex.build()
     print("index entries loaded: \(index.count)")
 
     let start = Date()
     let scored = SessionSearch.rank(query: query, index: index)
-    print("candidates: \(scored.map { "\($0.entry.sessionName)=\($0.score)" })")
+    print("candidates: \(scored.prefix(8).map { "\($0.entry.sessionName)=\($0.score)" })")
     var rows = SessionSearch.rows(from: scored, query: query)
-    var source = rows.isEmpty ? "no_match" : "instant_keyword"
+    var source = rows.isEmpty ? "no_match" : "local"
 
-    if scored.count > 1, !SessionSearch.isClearWinner(scored) {
-        if let order = await Ollama.rerank(query: query, candidates: scored), !order.isEmpty {
-            var byName: [String: SearchResultRow] = [:]
-            for row in rows { byName[row.sessionName] = row }
+    if semantic, !scored.isEmpty {
+        print("claude command: \(HaikuRerank.executablePath ?? "NOT FOUND")")
+        if let order = await HaikuRerank.rank(query: query, candidates: scored), !order.isEmpty {
+            var byId: [String: SearchResultRow] = [:]
+            for row in rows { byId[row.sessionId] = row }
             var reordered: [SearchResultRow] = []
-            for name in order { if let row = byName.removeValue(forKey: name) { reordered.append(row) } }
-            for row in rows where byName[row.sessionName] != nil { reordered.append(row) }
+            for sessionId in order {
+                if let row = byId.removeValue(forKey: sessionId) { reordered.append(row) }
+            }
+            for row in rows where byId[row.sessionId] != nil { reordered.append(row) }
             rows = reordered
-            source = "qwen_rerank"
+            source = "semantic_haiku"
+        } else {
+            source = "semantic_failed"
         }
     }
 
@@ -255,7 +301,7 @@ enum SessionSearchWidgetMain {
     static func main() async {
         let args = CommandLine.arguments
         if let flag = args.firstIndex(of: "--cli-test"), args.count > flag + 1 {
-            await runCLITest(query: args[flag + 1])
+            await runCLITest(query: args[flag + 1], semantic: args.contains("--semantic"))
             return
         }
         let app = NSApplication.shared

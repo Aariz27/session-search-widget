@@ -53,6 +53,9 @@ struct ScoredEntry {
 // MARK: - What the panel renders, one per visible row
 
 struct SearchResultRow {
+    /// The conversation's id. Two sessions can share a title, so this is what matches a
+    /// row back to Haiku's answer.
+    let sessionId: String
     let sessionName: String
     /// Folder name only (e.g. "Modulaa"), shown as the dimmed subtitle.
     let projectName: String
@@ -68,7 +71,7 @@ struct SearchResultRow {
 struct SearchOutcome {
     let query: String
     let sessionName: String
-    /// "instant_keyword" | "qwen_rerank" | "no_match"
+    /// "local" | "semantic_haiku" | "semantic_failed" | "no_match"
     let source: String
     let durationMs: Double
     /// 0-based row position the user actually chose, nil if never chosen.

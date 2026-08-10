@@ -53,6 +53,33 @@ protocol SpotlightPanelDelegate: AnyObject {
     func spotlightSubmitted(row: SearchResultRow, rank: Int)
     func spotlightDismissed()
     func spotlightFeedback(correct: Bool, row: SearchResultRow, rank: Int)
+    /// You pressed Tab, which swaps between matching words on this machine and asking
+    /// Claude Haiku what you meant.
+    func spotlightModeToggled(to mode: SearchMode)
+}
+
+/// Which of the two searches the panel is currently running.
+enum SearchMode {
+    /// Matches the words you typed against the text of every session. Runs on this
+    /// machine, costs nothing, returns in under a tenth of a second.
+    case local
+    /// Sends the shortlist to Claude Haiku to be reordered by meaning. Bills your
+    /// Claude subscription and takes several seconds.
+    case semantic
+
+    var label: String {
+        switch self {
+        case .local: return "Local"
+        case .semantic: return "Semantic"
+        }
+    }
+
+    var toggled: SearchMode {
+        switch self {
+        case .local: return .semantic
+        case .semantic: return .local
+        }
+    }
 }
 
 // MARK: - Panel
@@ -189,6 +216,9 @@ final class SpotlightController: NSObject {
     private let tintOverlayView = TopDownView()
     private let searchRow = TopDownView()
     private let searchIcon = NSImageView()
+    private let modeChip = NSTextField(labelWithString: "")
+    /// Local matching is the default because most of the time you know which session you want.
+    private(set) var mode: SearchMode = .local
     private let textField = NSTextField()
     private let progressIndicator = NSProgressIndicator()
     private let divider = TopDownView()
@@ -353,9 +383,19 @@ final class SpotlightController: NSObject {
             height: progressSize
         )
 
+        // The chip tells you which search Tab has you in, so you never spend money by accident.
+        modeChip.font = .systemFont(ofSize: 10, weight: .semibold)
+        modeChip.alignment = .center
+        modeChip.wantsLayer = true
+        modeChip.layer?.cornerRadius = 4
+        modeChip.isBezeled = false
+        modeChip.isEditable = false
+        modeChip.drawsBackground = false
+        applyModeChipStyle()
+
         let textFieldX = 16 + iconSize + 11
         let textFieldHeight: CGFloat = 22
-        let textFieldWidth = progressIndicator.frame.minX - 8 - textFieldX
+        let textFieldWidth = modeChip.frame.minX - 10 - textFieldX
         textField.isBordered = false
         textField.backgroundColor = .clear
         textField.drawsBackground = false
@@ -379,7 +419,36 @@ final class SpotlightController: NSObject {
         searchRow.frame = NSRect(x: 0, y: 0, width: panelWidth, height: searchRowHeight)
         searchRow.addSubview(searchIcon)
         searchRow.addSubview(textField)
+        searchRow.addSubview(modeChip)
         searchRow.addSubview(progressIndicator)
+    }
+
+    /// Paints the chip grey for the local search and amber for the paid semantic one.
+    private func applyModeChipStyle() {
+        let chipWidth: CGFloat = 74
+        let chipHeight: CGFloat = 18
+        modeChip.frame = NSRect(
+            x: progressIndicator.frame.minX - 10 - chipWidth,
+            y: (searchRowHeight - chipHeight) / 2,
+            width: chipWidth,
+            height: chipHeight
+        )
+        modeChip.stringValue = "⇥ " + mode.label
+        switch mode {
+        case .local:
+            modeChip.textColor = NSColor(white: 0.6, alpha: 1)
+            modeChip.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.07).cgColor
+        case .semantic:
+            modeChip.textColor = NSColor(red: 1.0, green: 0.72, blue: 0.35, alpha: 1)
+            modeChip.layer?.backgroundColor = NSColor(red: 1.0, green: 0.62, blue: 0.2, alpha: 0.16).cgColor
+        }
+    }
+
+    /// Flips between the two searches and tells the app to re-run the current query.
+    func toggleMode() {
+        mode = mode.toggled
+        applyModeChipStyle()
+        delegate?.spotlightModeToggled(to: mode)
     }
 
     private func buildDivider() {
@@ -686,6 +755,12 @@ extension SpotlightController: NSTextFieldDelegate {
             let index = tableView.selectedRow
             guard index >= 0, index < rows.count else { return true }
             delegate?.spotlightSubmitted(row: rows[index], rank: index)
+            return true
+
+        // Tab would otherwise move focus out of the search field, so it has to be
+        // swallowed here and turned into the mode switch.
+        case #selector(NSResponder.insertTab(_:)), #selector(NSResponder.insertBacktab(_:)):
+            toggleMode()
             return true
 
         case #selector(NSResponder.cancelOperation(_:)):
