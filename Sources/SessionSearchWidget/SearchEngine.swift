@@ -568,6 +568,16 @@ enum HaikuRerank {
                 process.currentDirectoryURL = scratchDirectory
                 process.standardError = FileHandle.nullDevice
 
+                // Without this, Haiku writes a 2,000-3,000 character reasoning block before
+                // answering, which is most of the wait. Measured on the same ranking:
+                // 9.7s and 16.9s with thinking on, 2.9s and 3.8s with it off, same top answer.
+                // MAX_THINKING_TOKENS is read from the environment, not from a flag, and the
+                // widget inherits CLAUDE_EFFORT=high from whatever shell launched it.
+                var environment = ProcessInfo.processInfo.environment
+                environment["MAX_THINKING_TOKENS"] = "0"
+                environment["CLAUDE_EFFORT"] = "low"
+                process.environment = environment
+
                 let pipe = Pipe()
                 process.standardOutput = pipe
 

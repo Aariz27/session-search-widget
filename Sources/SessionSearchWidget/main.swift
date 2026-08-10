@@ -295,11 +295,52 @@ func runCLITest(query: String, semantic: Bool) async {
     print("timings log: \(SearchLog.timingsURL.path)")
 }
 
+/// Runs several semantic searches back to back against one warm `claude` process and prints
+/// the time each took, so the speed-up from reusing the process is visible.
+@MainActor
+func runCLIBench(queries: [String]) async {
+    let index = SessionIndex.build()
+    print("index entries loaded: \(index.count)")
+    print("claude command: \(HaikuRerank.executablePath ?? "NOT FOUND")")
+    guard !queries.isEmpty else {
+        print("pass at least one query")
+        return
+    }
+
+    for (position, query) in queries.enumerated() {
+        let scored = SessionSearch.rank(query: query, index: index)
+        guard !scored.isEmpty else {
+            print("\(position + 1). \"\(query)\" — no local matches, nothing to rank")
+            continue
+        }
+        let start = Date()
+        let order = await HaikuRerank.rank(query: query, candidates: scored)
+        let elapsedMs = Date().timeIntervalSince(start) * 1000
+
+        let topName: String
+        if let firstId = order?.first, let match = index.first(where: { $0.sessionId == firstId }) {
+            topName = match.sessionName
+        } else {
+            topName = "FAILED — fell back to local order"
+        }
+        print(String(format: "%d. %5.0fms  \"%@\"  ->  %@", position + 1, elapsedMs, query, topName))
+    }
+
+}
+
 @main
 enum SessionSearchWidgetMain {
     @MainActor
     static func main() async {
         let args = CommandLine.arguments
+        // `--cli-bench "query one" "query two" …` runs several semantic searches through the
+        // one warm process and prints how long each took, which is the only way to see the
+        // speed-up: a single search cannot show it, because the first one starts the process.
+        if let flag = args.firstIndex(of: "--cli-bench") {
+            let queries = Array(args[(flag + 1)...]).filter { !$0.hasPrefix("--") }
+            await runCLIBench(queries: queries)
+            return
+        }
         if let flag = args.firstIndex(of: "--cli-test"), args.count > flag + 1 {
             await runCLITest(query: args[flag + 1], semantic: args.contains("--semantic"))
             return
