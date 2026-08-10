@@ -24,7 +24,7 @@ enum SessionIndex {
     /// Builds the searchable list from every real Claude Code transcript on this machine,
     /// then folds in the 3-bullet summaries the hooks write into each project's sessions.json.
     static func build() -> [IndexEntry] {
-        let transcripts = loadTranscripts()
+        let transcripts = mergeForks(loadTranscripts())
         let summaries = loadHookSummaries()
 
         return transcripts.map { transcript in
@@ -52,6 +52,94 @@ enum SessionIndex {
             )
         }
         .sorted { $0.startedAt > $1.startedAt }
+    }
+
+    // MARK: Collapsing resume and compaction forks
+
+    /// Every time you resume or compact a session, Claude Code writes a new transcript file
+    /// and copies the earlier messages into it, so one conversation ends up spread over
+    /// several files with the same title. This groups files that share any message id and
+    /// returns one entry per conversation: the file you would actually resume, carrying the
+    /// combined text of every file in the group.
+    ///
+    /// Grouping is transitive. A resume of a resume shares no message with the original
+    /// once compaction has dropped the early messages, but the middle file links the two.
+    static func mergeForks(_ transcripts: [CachedTranscript]) -> [CachedTranscript] {
+        guard transcripts.count > 1 else { return transcripts }
+
+        var parent = Array(0..<transcripts.count)
+
+        func root(_ index: Int) -> Int {
+            var current = index
+            while parent[current] != current {
+                parent[current] = parent[parent[current]]
+                current = parent[current]
+            }
+            return current
+        }
+
+        func union(_ a: Int, _ b: Int) {
+            let rootA = root(a)
+            let rootB = root(b)
+            if rootA != rootB { parent[rootB] = rootA }
+        }
+
+        // One pass over every message id: the first file to claim an id owns it, and any
+        // later file carrying the same id joins that file's group.
+        var owner: [String: Int] = [:]
+        for (position, transcript) in transcripts.enumerated() {
+            for messageId in transcript.messageIds {
+                if let existing = owner[messageId] {
+                    union(existing, position)
+                } else {
+                    owner[messageId] = position
+                }
+            }
+        }
+
+        var groups: [Int: [CachedTranscript]] = [:]
+        for (position, transcript) in transcripts.enumerated() {
+            groups[root(position), default: []].append(transcript)
+        }
+
+        return groups.values.map { group in
+            guard group.count > 1 else { return group[0] }
+
+            // Resume the file that was written to most recently: that is the live one.
+            let newest = group.max { $0.modifiedAt < $1.modifiedAt }!
+
+            // A real title Claude wrote beats a fallback built from your opening words.
+            let titled = group.first { $0.hasAiTitle }
+            let title = titled?.title ?? newest.title
+
+            // The conversation began when its earliest file began.
+            let earliestStart = group.compactMap { $0.startedAt.isEmpty ? nil : $0.startedAt }.min() ?? newest.startedAt
+
+            // Keep the text of every file so a search still finds words that only survive
+            // in an older copy. The longest copy is the base; a shorter copy is appended
+            // whole only when the base does not already contain it, which keeps the
+            // sentences readable for the snippet shown under each result.
+            let byLength = group.sorted { $0.text.count > $1.text.count }
+            var combined = byLength[0].text
+            for transcript in byLength.dropFirst() where !transcript.text.isEmpty {
+                if !combined.contains(transcript.text) {
+                    combined += " " + transcript.text
+                }
+            }
+
+            return CachedTranscript(
+                sessionId: newest.sessionId,
+                path: newest.path,
+                modifiedAt: newest.modifiedAt,
+                byteSize: newest.byteSize,
+                title: title,
+                hasAiTitle: titled != nil,
+                cwd: newest.cwd,
+                startedAt: earliestStart,
+                text: String(combined.prefix(maxTextPerSession)),
+                messageIds: []
+            )
+        }
     }
 
     // MARK: Transcripts
@@ -136,6 +224,7 @@ enum SessionIndex {
         var cwd = ""
         var startedAt = ""
         var typedText = ""
+        var messageIds: [String] = []
 
         for line in raw.split(separator: "\n", omittingEmptySubsequences: true) {
             guard let lineData = line.data(using: .utf8) else { continue }
@@ -145,6 +234,10 @@ enum SessionIndex {
             if type == "ai-title", let value = object["aiTitle"] as? String, !value.isEmpty {
                 aiTitle = value
                 continue
+            }
+
+            if let messageId = object["uuid"] as? String, !messageId.isEmpty {
+                messageIds.append(messageId)
             }
 
             guard type == "user" else { continue }
@@ -177,9 +270,11 @@ enum SessionIndex {
             modifiedAt: modifiedAt,
             byteSize: byteSize,
             title: title,
+            hasAiTitle: !aiTitle.isEmpty,
             cwd: cwd,
             startedAt: startedAt,
-            text: String(typedText.prefix(maxTextPerSession))
+            text: String(typedText.prefix(maxTextPerSession)),
+            messageIds: messageIds
         )
     }
 

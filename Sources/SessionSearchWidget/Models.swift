@@ -35,9 +35,14 @@ struct CachedTranscript: Codable {
     let modifiedAt: Double
     let byteSize: Int
     let title: String
+    /// True when Claude wrote the title itself, false when it fell back to your opening words.
+    let hasAiTitle: Bool
     let cwd: String
     let startedAt: String
     let text: String
+    /// Every message id in this file. Resuming or compacting a session writes a new file
+    /// that copies the earlier messages, so two files sharing an id are the same conversation.
+    let messageIds: [String]
 }
 
 struct ScoredEntry {
