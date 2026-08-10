@@ -25,7 +25,7 @@ enum SessionIndex {
     /// then folds in the 3-bullet summaries the hooks write into each project's sessions.json.
     static func build() -> [IndexEntry] {
         let transcripts = mergeForks(loadTranscripts())
-        let summaries = loadHookSummaries()
+        let summaries = loadHookSummaries(folders: Set(transcripts.map { $0.cwd }))
 
         return transcripts.map { transcript in
             var title = transcript.title
@@ -312,29 +312,28 @@ enum SessionIndex {
 
     // MARK: Hook summaries
 
-    /// Reads every sessions.json the hooks wrote under ~/Documents, keyed by session id.
+    /// Reads the names and 3-bullet summaries your hooks wrote, keyed by session id.
     /// Nothing here is written to; the hooks stay exactly as they are.
-    private static func loadHookSummaries() -> [String: SessionRecord] {
+    ///
+    /// The hook writes `sessions.json` into the folder the session ran in, so instead of
+    /// crawling your home folder — which would walk Library and every node_modules — this
+    /// looks in exactly the folders your sessions ran in, plus your home folder itself.
+    /// That covers home and everywhere below it, at one file check per folder.
+    private static func loadHookSummaries(folders: Set<String>) -> [String: SessionRecord] {
         let fileManager = FileManager.default
-        let root: URL
+        var candidates = folders
+        candidates.insert(fileManager.homeDirectoryForCurrentUser.path)
+
+        // A test run can point the whole lookup somewhere else.
         if let overridePath = ProcessInfo.processInfo.environment["SSW_INDEX_ROOT"], !overridePath.isEmpty {
-            root = URL(fileURLWithPath: overridePath, isDirectory: true)
-        } else {
-            root = fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Documents", isDirectory: true)
+            candidates = [overridePath]
         }
 
         var summaries: [String: SessionRecord] = [:]
 
-        guard let enumerator = fileManager.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else {
-            return summaries
-        }
-
-        for case let fileURL as URL in enumerator {
-            guard fileURL.lastPathComponent == "sessions.json" else { continue }
+        for folder in candidates {
+            let fileURL = URL(fileURLWithPath: folder, isDirectory: true)
+                .appendingPathComponent("sessions.json")
             guard let data = try? Data(contentsOf: fileURL) else { continue }
             guard let records = try? JSONDecoder().decode([SessionRecord].self, from: data) else { continue }
             for record in records { summaries[record.session_id] = record }
