@@ -380,14 +380,6 @@ enum SessionSearch {
         return scored
     }
 
-    /// True when the top score beats the runner-up by >= 2, i.e. no model help needed.
-    static func isClearWinner(_ scored: [ScoredEntry]) -> Bool {
-        guard let top = scored.first else { return false }
-        guard scored.count > 1 else { return true }
-        let runnerUp = scored[1]
-        return (top.score - runnerUp.score) >= 2
-    }
-
     /// Builds the display rows (incl. the `claude --resume "..."` command string) from scored entries.
     static func rows(from scored: [ScoredEntry], query: String) -> [SearchResultRow] {
         let tokens = tokenize(query)
