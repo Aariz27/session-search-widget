@@ -24,7 +24,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         index = SessionIndex.build()
-        PickMemory.load()
 
         controller = SpotlightController()
         controller.delegate = self
@@ -84,26 +83,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         semanticGeneration += 1
         let generation = semanticGeneration
 
-        // You have answered this question before and picked a session. Show that instead of
-        // spending 15 seconds and about 3 cents asking Claude the same thing again.
-        let remembered = PickMemory.exactMatches(for: question)
-        if !remembered.isEmpty {
-            var byId: [String: IndexEntry] = [:]
-            for entry in index { byId[entry.sessionId] = entry }
-            let entries = remembered.compactMap { byId[SessionIndex.forkAliases[$0] ?? $0] }
-            if !entries.isEmpty {
-                let rows = SessionSearch.rows(from: entries.map { ScoredEntry(entry: $0, score: 1) }, query: question)
-                currentRows = rows
-                lastSource = "remembered"
-                lastDurationMs = 0
-                controller.setSearching(false)
-                controller.setAnswer("You picked this before for the same question.")
-                controller.setRows(rows)
-                controller.setStatus("\(rows.count) from memory · 0ms · $0 — change a word to ask Claude fresh")
-                return
-            }
-        }
-
         guard AskAgent.isAvailable else {
             controller.setStatus("the claude command was not found on this machine")
             return
@@ -158,7 +137,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func outcome(for row: SearchResultRow, rank: Int?) -> SearchOutcome {
         SearchOutcome(
             query: currentQuery,
-            sessionId: row.sessionId,
             sessionName: row.sessionName,
             source: lastSource,
             durationMs: lastDurationMs,
@@ -198,37 +176,14 @@ extension AppDelegate: SpotlightPanelDelegate {
     private func runLocalSearch(_ query: String) {
         let start = Date()
         currentScored = SessionSearch.rank(query: query, index: index)
-        var rows = SessionSearch.rows(from: currentScored, query: query)
-
-        // A session you already chose for this question goes to the top, ahead of scoring.
-        let remembered = PickMemory.exactMatches(for: query) + PickMemory.similarMatches(for: query)
-        let rememberedCount = promote(&rows, ids: remembered)
-
-        currentRows = rows
+        currentRows = SessionSearch.rows(from: currentScored, query: query)
         lastDurationMs = Date().timeIntervalSince(start) * 1000
-        lastSource = rows.isEmpty ? "no_match" : "local"
+        lastSource = currentRows.isEmpty ? "no_match" : "local"
 
-        controller.setRows(rows)
-        controller.setStatus(rows.isEmpty
+        controller.setRows(currentRows)
+        controller.setStatus(currentRows.isEmpty
             ? "no matches"
-            : "\(rows.count) results · \(String(format: "%.1f", lastDurationMs))ms · local"
-              + (rememberedCount > 0 ? " · \(rememberedCount) you picked before" : ""))
-    }
-
-    /// Moves the given sessions to the front of the list, keeping their given order.
-    /// Returns how many were actually found and moved.
-    @discardableResult
-    private func promote(_ rows: inout [SearchResultRow], ids: [String]) -> Int {
-        guard !ids.isEmpty, !rows.isEmpty else { return 0 }
-        var moved: [SearchResultRow] = []
-        for id in ids {
-            let resolved = SessionIndex.forkAliases[id] ?? id
-            if let position = rows.firstIndex(where: { $0.sessionId == resolved }) {
-                moved.append(rows.remove(at: position))
-            }
-        }
-        rows = moved + rows
-        return moved.count
+            : "\(currentRows.count) results · \(String(format: "%.1f", lastDurationMs))ms · local")
     }
 
     func spotlightModeToggled(to mode: SearchMode) {
@@ -259,7 +214,6 @@ extension AppDelegate: SpotlightPanelDelegate {
         pb.clearContents()
         pb.setString(row.command, forType: .string)
         SearchLog.logSelection(outcome(for: row, rank: rank))
-        PickMemory.remember(query: currentQuery, sessionId: row.sessionId)
         controller.hide()
         outsideClick.stop()
         openInTerminal(row: row)
@@ -317,27 +271,13 @@ extension AppDelegate: SpotlightPanelDelegate {
 @MainActor
 func runCLITest(query: String, semantic: Bool) async {
     let index = SessionIndex.build()
-    PickMemory.load()
-    print("index entries loaded: \(index.count)  remembered queries: \(PickMemory.byQuery.count)")
+    print("index entries loaded: \(index.count)")
 
     let start = Date()
     let scored = SessionSearch.rank(query: query, index: index)
     print("candidates: \(scored.prefix(8).map { "\($0.entry.sessionName)=\($0.score)" })")
     var rows = SessionSearch.rows(from: scored, query: query)
     var source = rows.isEmpty ? "no_match" : "local"
-
-    let remembered = PickMemory.exactMatches(for: query) + PickMemory.similarMatches(for: query)
-    if !remembered.isEmpty {
-        var moved: [SearchResultRow] = []
-        for id in remembered {
-            let resolved = SessionIndex.forkAliases[id] ?? id
-            if let position = rows.firstIndex(where: { $0.sessionId == resolved }) {
-                moved.append(rows.remove(at: position))
-            }
-        }
-        rows = moved + rows
-        if !moved.isEmpty { print("promoted \(moved.count) session(s) you picked before") }
-    }
 
     if semantic {
         print("claude command: \(AskAgent.executablePath ?? "NOT FOUND")")
@@ -367,7 +307,7 @@ func runCLITest(query: String, semantic: Bool) async {
         print("RESULT: no match  [\(source), \(String(format: "%.0f", durationMs))ms]")
         return
     }
-    let outcome = SearchOutcome(query: query, sessionId: top.sessionId, sessionName: top.sessionName, source: source, durationMs: durationMs, selectedRank: nil)
+    let outcome = SearchOutcome(query: query, sessionName: top.sessionName, source: source, durationMs: durationMs, selectedRank: nil)
     SearchLog.logQuery(outcome)
     print("RESULT: \(top.command)  [\(source), \(String(format: "%.0f", durationMs))ms]")
     print("ranked: \(rows.map { $0.sessionName })")

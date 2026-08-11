@@ -72,9 +72,6 @@ struct SearchResultRow {
 
 struct SearchOutcome {
     let query: String
-    /// The id is what gets remembered. A session's name can change when you rename it, but
-    /// its id never does.
-    let sessionId: String
     let sessionName: String
     /// "local" | "semantic_haiku" | "semantic_failed" | "no_match"
     let source: String

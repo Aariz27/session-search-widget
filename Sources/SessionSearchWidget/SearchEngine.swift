@@ -749,7 +749,6 @@ enum SearchLog {
             "duration_ms": outcome.durationMs,
             "source": outcome.source,
             "result_session_name": outcome.sessionName,
-            "result_session_id": outcome.sessionId,
         ]
         if let selectedRank = outcome.selectedRank {
             record["selected_rank"] = selectedRank
@@ -764,7 +763,6 @@ enum SearchLog {
             "duration_ms": outcome.durationMs,
             "source": outcome.source,
             "result_session_name": outcome.sessionName,
-            "result_session_id": outcome.sessionId,
         ]
         if let selectedRank = outcome.selectedRank {
             record["selected_rank"] = selectedRank
@@ -806,90 +804,5 @@ enum SearchLog {
         } else {
             try? lineData.write(to: url)
         }
-    }
-}
-
-// MARK: - Remembering which session you picked
-
-/// Every time you press Enter on a result, the query and the session you chose are written to
-/// `search-timings.jsonl`. This reads those back so a query you have answered before is
-/// answered instantly and, in Ask mode, without paying Claude again.
-///
-/// This is a dictionary, not a splay tree. A splay tree pays for rotations on every lookup to
-/// keep hot items near the root; a dictionary is already constant time at this size, and the
-/// saving here comes from not re-running the search at all, not from the shape of the lookup.
-enum PickMemory {
-    /// One remembered choice.
-    struct Pick {
-        let sessionId: String
-        let at: String
-    }
-
-    /// Normalised query -> the sessions you picked for it, most recent first.
-    nonisolated(unsafe) private(set) static var byQuery: [String: [Pick]] = [:]
-
-    /// Reduces a query to the set of words that matter, so "Simplify LocalWispr!" and
-    /// "simplify localwispr" are treated as the same question.
-    static func normalise(_ query: String) -> String {
-        let pieces = query.lowercased().split { !($0.isLetter || $0.isNumber) }
-        return pieces.sorted().joined(separator: " ")
-    }
-
-    private static func tokens(_ query: String) -> Set<String> {
-        Set(query.lowercased().split { !($0.isLetter || $0.isNumber) }.map(String.init))
-    }
-
-    /// Rebuilds the memory from the log on disk. Cheap: the log is one short line per search.
-    static func load() {
-        byQuery = [:]
-        guard let data = try? Data(contentsOf: SearchLog.timingsURL),
-              let text = String(data: data, encoding: .utf8) else { return }
-
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard let lineData = line.data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
-            // Only lines where you actually chose a row count as a correct answer.
-            guard object["selected_rank"] != nil else { continue }
-            guard let query = object["query"] as? String, !query.isEmpty else { continue }
-            guard let sessionId = object["result_session_id"] as? String, !sessionId.isEmpty else { continue }
-
-            let pick = Pick(sessionId: sessionId, at: (object["at"] as? String) ?? "")
-            byQuery[normalise(query), default: []].insert(pick, at: 0)
-        }
-    }
-
-    /// Records a pick straight away, so the next search sees it without re-reading the file.
-    static func remember(query: String, sessionId: String) {
-        guard !query.isEmpty, !sessionId.isEmpty else { return }
-        let pick = Pick(sessionId: sessionId, at: ISO8601DateFormatter().string(from: Date()))
-        byQuery[normalise(query), default: []].insert(pick, at: 0)
-    }
-
-    /// Sessions you picked for this exact question, most recent first.
-    static func exactMatches(for query: String) -> [String] {
-        guard let picks = byQuery[normalise(query)] else { return [] }
-        var seen = Set<String>()
-        return picks.compactMap { seen.insert($0.sessionId).inserted ? $0.sessionId : nil }
-    }
-
-    /// Sessions you picked for a question that shares most of its words with this one, so
-    /// "localwispr bugs" benefits from having answered "localwispr simplify bugs" before.
-    static func similarMatches(for query: String) -> [String] {
-        let wanted = tokens(query)
-        guard wanted.count >= 2 else { return [] }
-
-        var scored: [(id: String, overlap: Double)] = []
-        for (remembered, picks) in byQuery {
-            let other = tokens(remembered)
-            guard !other.isEmpty else { continue }
-            let shared = Double(wanted.intersection(other).count)
-            let overlap = shared / Double(min(wanted.count, other.count))
-            guard overlap >= 0.6 else { continue }
-            for pick in picks { scored.append((pick.sessionId, overlap)) }
-        }
-
-        scored.sort { $0.overlap > $1.overlap }
-        var seen = Set<String>()
-        return scored.compactMap { seen.insert($0.id).inserted ? $0.id : nil }
     }
 }
