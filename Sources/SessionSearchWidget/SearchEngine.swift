@@ -568,7 +568,11 @@ enum AskAgent {
         return found.isEmpty ? nil : found
     }()
 
-    static var isAvailable: Bool { executablePath != nil }
+    static var isAvailable: Bool { executablePath != nil && FileManager.default.isExecutableFile(atPath: searchScriptPath) }
+
+    /// The one command the agent is given. It lives with the session-search skill so a
+    /// Claude session in your terminal and this widget run exactly the same search.
+    static let searchScriptPath = "\(NSHomeDirectory())/.claude/skills/session-search/search.sh"
 
     /// A throwaway folder the agent runs inside. Your SessionStart hook writes a
     /// `sessions.json` row into whatever folder `claude` is launched from, so launching it
@@ -594,22 +598,39 @@ enum AskAgent {
     static func ask(question: String) async -> AskResult? {
         guard let executablePath, !question.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
 
+        // Handing over one ready-made command is what keeps this affordable. Letting the
+        // agent work out its own search took 5 turns, and every turn re-sends the whole
+        // conversation: 1,263 output tokens and 118,518 cache-read tokens, $0.056 a question.
+        // With the command supplied it takes 2 turns, 337 output tokens, and $0.032.
         let prompt = """
-        \(question)
+        Find which of my past Claude Code sessions match this question:
 
-        Use the session-search skill. Search every session on this machine, not just the \
-        current folder. Reply with ONLY a JSON object, no other text:
-        {"answer":"one or two plain sentences; quote the line that proves it","sessions":[{"id":"<session-id>"}]}
-        List at most 8 sessions, best match first. If nothing matches, say so in "answer" and \
-        return an empty "sessions" list.
+        "\(question)"
+
+        Run this ONE command, choosing an extended-regex that matches the question. It searches
+        every session transcript on the machine and prints: session-id, title, folder, hit count.
+
+          bash \(searchScriptPath) '<your regex>' 12
+
+        Notes: a slash command appears in a transcript as <command-name>/goal</command-name>.
+        For a topic, use alternation, e.g. 'marketing|lead gen|acquisition'.
+        Run the command at most twice. Then stop and answer.
+
+        Reply with ONLY this JSON and nothing else:
+        {"answer":"one short sentence","ids":["<session-id>"]}
+        At most 8 ids, best match first. If nothing matches, say so in "answer" and return an
+        empty "ids" list.
         """
 
         let arguments = [
             "-p", prompt,
             "--model", "haiku",
             "--output-format", "json",
-            // Read-only tools only. The agent greps and reads transcripts; it never edits.
-            "--allowedTools", "Bash Read Glob Grep",
+            // Bash alone: the one command it is told to run is all it needs, and every extra
+            // tool definition is context re-sent on every turn.
+            "--allowedTools", "Bash",
+            // The command is supplied directly, so loading every skill would only add context.
+            "--disable-slash-commands",
             "--no-session-persistence",
             "--no-chrome",
         ]
@@ -644,7 +665,11 @@ enum AskAgent {
 
         let answer = (object["answer"] as? String) ?? ""
         var ids: [String] = []
-        if let sessions = object["sessions"] as? [[String: Any]] {
+        // The compact shape the prompt asks for.
+        if let compact = object["ids"] as? [String] {
+            ids = compact.filter { !$0.isEmpty }
+        } else if let sessions = object["sessions"] as? [[String: Any]] {
+            // Tolerated fallback if the model answers in the longer shape anyway.
             for session in sessions {
                 if let id = session["id"] as? String, !id.isEmpty { ids.append(id) }
             }
@@ -664,6 +689,13 @@ enum AskAgent {
                 process.arguments = arguments
                 process.currentDirectoryURL = scratchDirectory
                 process.standardError = FileHandle.nullDevice
+
+                // Most of the output tokens were the model reasoning out loud before giving a
+                // one-line answer, and output is billed at the highest rate.
+                var environment = ProcessInfo.processInfo.environment
+                environment["MAX_THINKING_TOKENS"] = "0"
+                environment["CLAUDE_EFFORT"] = "low"
+                process.environment = environment
 
                 let pipe = Pipe()
                 process.standardOutput = pipe
