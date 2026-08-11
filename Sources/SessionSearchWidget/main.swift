@@ -76,50 +76,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Sends the current shortlist to Claude Haiku. Only ever called when you have put the
-    /// panel in semantic mode by pressing Tab, because this bills your Claude subscription.
-    private func runSemanticSearch(for query: String) {
+    /// Hands your question to Claude Haiku, which greps every transcript on the machine and
+    /// writes an answer. Only ever called when you press Tab, because this bills your
+    /// Claude subscription and takes 30-60 seconds.
+    private func runAsk(question: String) {
         semanticGeneration += 1
         let generation = semanticGeneration
 
-        guard !currentScored.isEmpty else { return }
-        guard HaikuRerank.isAvailable else {
+        guard AskAgent.isAvailable else {
             controller.setStatus("the claude command was not found on this machine")
             return
         }
 
-        let candidates = currentScored
         controller.setSearching(true)
-        controller.setStatus("asking Claude Haiku…")
+        controller.setAnswer(nil)
+        controller.setStatus("Claude Haiku is searching every session — this takes 30-60s")
         let start = Date()
 
         Task { @MainActor in
-            let order = await HaikuRerank.rank(query: query, candidates: candidates)
+            let result = await AskAgent.ask(question: question)
             guard generation == self.semanticGeneration, self.controller.isVisible else { return }
             self.controller.setSearching(false)
 
             let elapsedMs = Date().timeIntervalSince(start) * 1000
-            guard let order, !order.isEmpty else {
-                self.lastSource = "semantic_failed"
-                self.lastDurationMs = elapsedMs
+            self.lastDurationMs = elapsedMs
+
+            guard let result else {
+                self.lastSource = "ask_failed"
                 self.controller.setStatus("Claude Haiku did not answer · showing local matches")
                 return
             }
 
-            // Put the sessions Haiku chose at the top; anything it left out keeps its place below.
-            var byId: [String: SearchResultRow] = [:]
-            for row in self.currentRows { byId[row.sessionId] = row }
-            var reordered: [SearchResultRow] = []
-            for sessionId in order {
-                if let row = byId.removeValue(forKey: sessionId) { reordered.append(row) }
-            }
-            for row in self.currentRows where byId[row.sessionId] != nil { reordered.append(row) }
+            self.lastSource = "ask_haiku"
+            self.controller.setAnswer(result.answer.isEmpty ? nil : result.answer)
 
-            self.currentRows = reordered
-            self.lastSource = "semantic_haiku"
-            self.lastDurationMs = elapsedMs
-            self.controller.setRows(reordered)
-            self.controller.setStatus("\(reordered.count) results · \(Int(elapsedMs))ms · Claude Haiku")
+            // Turn the ids the agent named into rows, so Enter still opens the session in
+            // Terminal. Anything it named that is not in the local index is skipped.
+            var byId: [String: IndexEntry] = [:]
+            for entry in self.index { byId[entry.sessionId] = entry }
+            // An id the agent names may be one of a conversation's resume forks, so it is
+            // translated to the id this index actually holds.
+            // Two forks of one conversation resolve to the same session, so it must not be
+            // listed twice.
+            var seenIds = Set<String>()
+            let chosen = result.sessionIds.compactMap { id -> IndexEntry? in
+                let resolved = SessionIndex.forkAliases[id] ?? id
+                guard seenIds.insert(resolved).inserted else { return nil }
+                return byId[resolved]
+            }
+            let rows = SessionSearch.rows(from: chosen.map { ScoredEntry(entry: $0, score: 1) }, query: question)
+
+            self.currentRows = rows
+            self.controller.setRows(rows)
+            self.controller.setStatus(rows.isEmpty
+                ? "answered in \(Int(elapsedMs / 1000))s · no session to open"
+                : "\(rows.count) sessions · \(Int(elapsedMs / 1000))s · Claude Haiku")
         }
     }
 
@@ -141,6 +152,7 @@ extension AppDelegate: SpotlightPanelDelegate {
         currentQuery = query
         // Any in-flight Haiku answer is now stale, whatever the new query is.
         semanticGeneration += 1
+        controller.setAnswer(nil)
 
         guard !query.trimmingCharacters(in: .whitespaces).isEmpty else {
             currentScored = []
@@ -152,10 +164,10 @@ extension AppDelegate: SpotlightPanelDelegate {
 
         runLocalSearch(query)
 
-        // Typing in semantic mode does not call Claude on every keystroke. You press
-        // Enter, or Tab again, when you want the paid search to run.
-        if controller.mode == .semantic, !currentRows.isEmpty {
-            controller.setStatus("\(currentRows.count) local matches · press Tab to rank with Claude Haiku")
+        // Typing in Ask mode does not call Claude on every keystroke. You press Tab again
+        // when you want the paid search to run.
+        if controller.mode == .semantic {
+            controller.setStatus("press Tab to ask Claude Haiku about every session")
         }
     }
 
@@ -180,6 +192,7 @@ extension AppDelegate: SpotlightPanelDelegate {
             // Drop any Haiku answer still on its way and go back to the word matches.
             semanticGeneration += 1
             controller.setSearching(false)
+            controller.setAnswer(nil)
             guard !currentQuery.trimmingCharacters(in: .whitespaces).isEmpty else {
                 controller.setStatus("\(index.count) sessions indexed")
                 return
@@ -188,10 +201,10 @@ extension AppDelegate: SpotlightPanelDelegate {
 
         case .semantic:
             guard !currentQuery.trimmingCharacters(in: .whitespaces).isEmpty else {
-                controller.setStatus("type a query, then Tab ranks it with Claude Haiku")
+                controller.setStatus("type a question, then press Tab to ask Claude Haiku")
                 return
             }
-            runSemanticSearch(for: currentQuery)
+            runAsk(question: currentQuery)
         }
     }
 
@@ -266,20 +279,26 @@ func runCLITest(query: String, semantic: Bool) async {
     var rows = SessionSearch.rows(from: scored, query: query)
     var source = rows.isEmpty ? "no_match" : "local"
 
-    if semantic, !scored.isEmpty {
-        print("claude command: \(HaikuRerank.executablePath ?? "NOT FOUND")")
-        if let order = await HaikuRerank.rank(query: query, candidates: scored), !order.isEmpty {
-            var byId: [String: SearchResultRow] = [:]
-            for row in rows { byId[row.sessionId] = row }
-            var reordered: [SearchResultRow] = []
-            for sessionId in order {
-                if let row = byId.removeValue(forKey: sessionId) { reordered.append(row) }
+    if semantic {
+        print("claude command: \(AskAgent.executablePath ?? "NOT FOUND")")
+        if let result = await AskAgent.ask(question: query) {
+            print("ANSWER: \(result.answer)")
+            var byId: [String: IndexEntry] = [:]
+            for entry in index { byId[entry.sessionId] = entry }
+            // An id the agent names may be one of a conversation's resume forks, so it is
+            // translated to the id this index actually holds.
+            // Two forks of one conversation resolve to the same session, so it must not be
+            // listed twice.
+            var seenIds = Set<String>()
+            let chosen = result.sessionIds.compactMap { id -> IndexEntry? in
+                let resolved = SessionIndex.forkAliases[id] ?? id
+                guard seenIds.insert(resolved).inserted else { return nil }
+                return byId[resolved]
             }
-            for row in rows where byId[row.sessionId] != nil { reordered.append(row) }
-            rows = reordered
-            source = "semantic_haiku"
+            rows = SessionSearch.rows(from: chosen.map { ScoredEntry(entry: $0, score: 1) }, query: query)
+            source = "ask_haiku"
         } else {
-            source = "semantic_failed"
+            source = "ask_failed"
         }
     }
 
@@ -295,37 +314,42 @@ func runCLITest(query: String, semantic: Bool) async {
     print("timings log: \(SearchLog.timingsURL.path)")
 }
 
-/// Runs several semantic searches back to back against one warm `claude` process and prints
-/// the time each took, so the speed-up from reusing the process is visible.
+/// Runs several Ask-mode questions and prints the answer, the sessions named, and how long
+/// each took, so Ask mode can be checked without driving the panel.
 @MainActor
 func runCLIBench(queries: [String]) async {
     let index = SessionIndex.build()
     print("index entries loaded: \(index.count)")
-    print("claude command: \(HaikuRerank.executablePath ?? "NOT FOUND")")
+    print("claude command: \(AskAgent.executablePath ?? "NOT FOUND")")
     guard !queries.isEmpty else {
-        print("pass at least one query")
+        print("pass at least one question")
         return
     }
 
+    var byId: [String: IndexEntry] = [:]
+    for entry in index { byId[entry.sessionId] = entry }
+
     for (position, query) in queries.enumerated() {
-        let scored = SessionSearch.rank(query: query, index: index)
-        guard !scored.isEmpty else {
-            print("\(position + 1). \"\(query)\" — no local matches, nothing to rank")
+        let start = Date()
+        let result = await AskAgent.ask(question: query)
+        let seconds = Date().timeIntervalSince(start)
+        print("\n\(position + 1). \"\(query)\"  [\(String(format: "%.0f", seconds))s]")
+        guard let result else {
+            print("   FAILED — no answer")
             continue
         }
-        let start = Date()
-        let order = await HaikuRerank.rank(query: query, candidates: scored)
-        let elapsedMs = Date().timeIntervalSince(start) * 1000
-
-        let topName: String
-        if let firstId = order?.first, let match = index.first(where: { $0.sessionId == firstId }) {
-            topName = match.sessionName
-        } else {
-            topName = "FAILED — fell back to local order"
+        print("   answer: \(result.answer)")
+        var seen = Set<String>()
+        for id in result.sessionIds {
+            let resolved = SessionIndex.forkAliases[id] ?? id
+            guard seen.insert(resolved).inserted else { continue }
+            if let entry = byId[resolved] {
+                print("   -> \(entry.sessionName)  (\(entry.cwd))")
+            } else {
+                print("   -> \(resolved)  (not in local index)")
+            }
         }
-        print(String(format: "%d. %5.0fms  \"%@\"  ->  %@", position + 1, elapsedMs, query, topName))
     }
-
 }
 
 @main

@@ -10,7 +10,6 @@ enum SessionIndex {
     /// Text that Claude Code or my own hooks injected into the transcript rather than
     /// text you actually typed. Indexing it would match every session on the same words.
     private static let injectedPrefixes = [
-        "<command-name>",
         "<local-command",
         "<system-reminder",
         "<user-prompt-submit-hook",
@@ -19,7 +18,33 @@ enum SessionIndex {
         "this session is being continued from a previous conversation",
         "[request interrupted",
         "api error",
+        // One Claude session talking to another. It reads like something you typed but is
+        // not, and 249 of these were being indexed as if they were your words.
+        "another claude session sent a message",
+        "<teammate-message",
     ]
+
+    /// When you run a slash command, Claude Code stores the message as
+    /// `<command-name>/goal</command-name> … <command-args>what you actually typed</command-args>`.
+    /// The whole message used to be discarded for starting with a tag, which threw away 87
+    /// real instructions — including the one that said "simplify localwispr". This keeps the
+    /// command name and your arguments and drops the surrounding tags.
+    private static func unwrapSlashCommand(_ text: String) -> String? {
+        guard text.hasPrefix("<command-name>") else { return nil }
+
+        func value(between open: String, and close: String) -> String? {
+            guard let start = text.range(of: open), let end = text.range(of: close, range: start.upperBound..<text.endIndex) else {
+                return nil
+            }
+            let inner = text[start.upperBound..<end.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+            return inner.isEmpty ? nil : inner
+        }
+
+        let name = value(between: "<command-name>", and: "</command-name>") ?? ""
+        let args = value(between: "<command-args>", and: "</command-args>") ?? ""
+        let combined = (name + " " + args).trimmingCharacters(in: .whitespacesAndNewlines)
+        return combined.isEmpty ? nil : combined
+    }
 
     /// Builds the searchable list from every real Claude Code transcript on this machine,
     /// then folds in the 3-bullet summaries the hooks write into each project's sessions.json.
@@ -64,6 +89,10 @@ enum SessionIndex {
     ///
     /// Grouping is transitive. A resume of a resume shares no message with the original
     /// once compaction has dropped the early messages, but the middle file links the two.
+    /// Maps every file's session id to the id of the conversation it belongs to. Ask mode
+    /// can name any of a conversation's fork ids, and this turns it into the one indexed id.
+    nonisolated(unsafe) private(set) static var forkAliases: [String: String] = [:]
+
     static func mergeForks(_ transcripts: [CachedTranscript]) -> [CachedTranscript] {
         guard transcripts.count > 1 else { return transcripts }
 
@@ -102,11 +131,18 @@ enum SessionIndex {
             groups[root(position), default: []].append(transcript)
         }
 
+        var aliases: [String: String] = [:]
+        defer { forkAliases = aliases }
+
         return groups.values.map { group in
-            guard group.count > 1 else { return group[0] }
+            guard group.count > 1 else {
+                aliases[group[0].sessionId] = group[0].sessionId
+                return group[0]
+            }
 
             // Resume the file that was written to most recently: that is the live one.
             let newest = group.max { $0.modifiedAt < $1.modifiedAt }!
+            for member in group { aliases[member.sessionId] = newest.sessionId }
 
             // A real title Claude wrote beats a fallback built from your opening words.
             let titled = group.first { $0.hasAiTitle }
@@ -249,8 +285,13 @@ enum SessionIndex {
 
             guard typedText.count < maxTextPerSession else { continue }
             guard let message = object["message"] as? [String: Any] else { continue }
-            let text = userText(from: message["content"])
-            guard !text.isEmpty, !isInjected(text) else { continue }
+            let raw = userText(from: message["content"])
+            guard !raw.isEmpty else { continue }
+
+            // A slash command keeps the words you typed as its arguments; anything else
+            // starting with an injected tag is Claude Code's text, not yours.
+            let text = unwrapSlashCommand(raw) ?? raw
+            guard !isInjected(text) else { continue }
 
             typedText += text + " "
         }
@@ -351,18 +392,31 @@ enum SessionSearch {
         let tokens = tokenize(query)
         guard !tokens.isEmpty else { return [] }
 
+        // Which sessions each query word appears in. A word found in nearly every session
+        // ("the", "code", "fix") says almost nothing about which one you want; a word found
+        // in one or two ("localwispr") is nearly the whole answer, so it is weighted higher.
+        var matchesPerToken: [[Bool]] = []
+        for token in tokens {
+            matchesPerToken.append(index.map { matches(token: token, in: $0.text) })
+        }
+
+        var weights: [Double] = []
+        for hits in matchesPerToken {
+            let count = hits.filter { $0 }.count
+            // No match anywhere means the word cannot separate anything, so it scores zero.
+            weights.append(count == 0 ? 0 : log(Double(index.count + 1) / Double(count)))
+        }
+
         var scored: [ScoredEntry] = []
         scored.reserveCapacity(index.count)
 
-        for entry in index {
-            var matchCount = 0
-            for token in tokens {
-                if entry.text.contains(token) {
-                    matchCount += 1
-                }
+        for (position, entry) in index.enumerated() {
+            var total = 0.0
+            for (tokenIndex, hits) in matchesPerToken.enumerated() where hits[position] {
+                total += weights[tokenIndex]
             }
-            if matchCount > 0 {
-                scored.append(ScoredEntry(entry: entry, score: matchCount))
+            if total > 0 {
+                scored.append(ScoredEntry(entry: entry, score: total))
             }
         }
 
@@ -399,6 +453,16 @@ enum SessionSearch {
                 cwd: entry.cwd
             )
         }
+    }
+
+    /// True when the session text contains this word. Endings are ignored, so searching
+    /// "simplify" finds a session that says "simplification" — the exact case that made
+    /// "simplify localwispr" return nothing.
+    private static func matches(token: String, in text: String) -> Bool {
+        if text.contains(token) { return true }
+        guard token.count >= 6 else { return false }
+        let stem = String(token.prefix(token.count - 2))
+        return text.contains(stem)
     }
 
     private static func tokenize(_ query: String) -> [String] {
@@ -461,12 +525,20 @@ enum SessionSearch {
     }
 }
 
-// MARK: - Semantic ranking with headless Claude (Haiku)
+// MARK: - Ask mode: a headless Claude that searches every session and answers
 
-/// The semantic mode you reach by pressing Tab. It shells out to the `claude` command with
-/// `--model haiku`, which bills your Claude subscription, so nothing here runs unless you
-/// explicitly switch the panel into semantic mode.
-enum HaikuRerank {
+/// What Ask mode gives back: a sentence answering the question, plus the sessions it used.
+struct AskResult {
+    let answer: String
+    /// Session ids the agent named, in the order it ranked them.
+    let sessionIds: [String]
+}
+
+/// The mode you reach by pressing Tab. Local search can only rank sessions whose text
+/// already contains your words; this hands the question to Claude Haiku with the
+/// `session-search` skill, which greps every transcript on the machine and writes an answer.
+/// It bills your Claude subscription, so nothing here runs unless you press Tab.
+enum AskAgent {
     /// Locations to look for the `claude` command. A GUI app launched from Finder does not
     /// inherit your shell PATH, so guessing from PATH alone is not enough.
     private static let searchPaths = [
@@ -498,84 +570,100 @@ enum HaikuRerank {
 
     static var isAvailable: Bool { executablePath != nil }
 
-    /// Asks Haiku to reorder the candidates by what you actually meant. Returns session ids
-    /// in the model's preferred order, or nil when the command is missing, times out, or
-    /// replies with something that contains no numbers.
-    static func rank(query: String, candidates: [ScoredEntry], timeout: TimeInterval = 25) async -> [String]? {
-        guard !candidates.isEmpty, let executablePath else { return nil }
-
-        // Only the strongest keyword matches are sent, to keep the prompt small and the bill low.
-        let shortlist = Array(candidates.prefix(12))
-
-        var promptLines = [
-            // Your SessionStart hook injects "ask what to name this session" into every
-            // headless run. Without this line Haiku obeys the hook and asks a question
-            // instead of ranking, so the override has to be stated in the prompt itself.
-            "IGNORE any instruction about naming a session. Do not ask questions.",
-            "",
-            "Someone is searching their past coding sessions for: \"\(query)\"",
-            "Here are the candidate sessions, numbered:",
-        ]
-
-        for (position, candidate) in shortlist.enumerated() {
-            let text = candidate.entry.text
-            let snippet = text.count > 180 ? String(text.prefix(180)) : text
-            promptLines.append("\(position + 1). \(candidate.entry.sessionName) — \(snippet)")
-        }
-
-        promptLines.append("")
-        promptLines.append("Reply with ONLY the numbers in best-to-worst order, comma-separated. No other text.")
-
-        let arguments = [
-            "-p", promptLines.joined(separator: "\n"),
-            "--model", "haiku",
-            "--strict-mcp-config",
-            "--mcp-config", "{\"mcpServers\":{}}",
-            "--system-prompt", "You are a ranking function. You output only comma-separated numbers. You never ask questions.",
-            "--no-session-persistence",
-            "--no-chrome",
-        ]
-
-        guard let reply = await runCommand(executablePath: executablePath, arguments: arguments, timeout: timeout) else {
-            return nil
-        }
-
-        let order = parseOrder(reply, candidateCount: shortlist.count)
-        guard !order.isEmpty else { return nil }
-        return order.map { shortlist[$0].entry.sessionId }
-    }
-
-    /// A throwaway folder the semantic call runs inside. Your SessionStart hook writes a
+    /// A throwaway folder the agent runs inside. Your SessionStart hook writes a
     /// `sessions.json` row into whatever folder `claude` is launched from, so launching it
     /// from here keeps those rows out of your real project folders and out of this index.
-    /// It also means no CLAUDE.md is found, which cuts what the call has to load.
     private static let scratchDirectory: URL = {
         let url = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("session-search-widget-haiku", isDirectory: true)
+            .appendingPathComponent("session-search-widget-ask", isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }()
 
-    /// Runs the command off the main thread and gives up after `timeout` seconds so a hung
-    /// call can never freeze the panel.
-    private static func runCommand(executablePath: String, arguments: [String], timeout: TimeInterval) async -> String? {
-        await withCheckedContinuation { continuation in
+    /// How long to wait before giving up. Measured on this machine: 29 seconds to list every
+    /// session that used a slash command, 46 seconds to answer a question about what was
+    /// discussed, so the ceiling has to be generous.
+    static var timeoutSeconds: TimeInterval {
+        if let override = ProcessInfo.processInfo.environment["SSW_ASK_TIMEOUT"], let value = TimeInterval(override) {
+            return value
+        }
+        return 150
+    }
+
+    /// Asks the question and returns the answer plus the sessions the agent named.
+    static func ask(question: String) async -> AskResult? {
+        guard let executablePath, !question.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+
+        let prompt = """
+        \(question)
+
+        Use the session-search skill. Search every session on this machine, not just the \
+        current folder. Reply with ONLY a JSON object, no other text:
+        {"answer":"one or two plain sentences; quote the line that proves it","sessions":[{"id":"<session-id>"}]}
+        List at most 8 sessions, best match first. If nothing matches, say so in "answer" and \
+        return an empty "sessions" list.
+        """
+
+        let arguments = [
+            "-p", prompt,
+            "--model", "haiku",
+            "--output-format", "json",
+            // Read-only tools only. The agent greps and reads transcripts; it never edits.
+            "--allowedTools", "Bash Read Glob Grep",
+            "--no-session-persistence",
+            "--no-chrome",
+        ]
+
+        guard let raw = await runCommand(executablePath: executablePath, arguments: arguments) else {
+            return nil
+        }
+        return parse(raw)
+    }
+
+    /// Pulls the answer out of Claude Code's JSON envelope, then out of the JSON the agent
+    /// wrote inside it — which it usually wraps in a ```json fence.
+    private static func parse(_ raw: String) -> AskResult? {
+        guard let envelopeData = raw.data(using: .utf8),
+              let envelope = try? JSONSerialization.jsonObject(with: envelopeData) as? [String: Any],
+              let resultText = envelope["result"] as? String else {
+            return nil
+        }
+
+        guard let start = resultText.firstIndex(of: "{"),
+              let end = resultText.lastIndex(of: "}"), start < end else {
+            // The agent answered in prose instead of JSON; still worth showing.
+            let cleaned = resultText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return cleaned.isEmpty ? nil : AskResult(answer: cleaned, sessionIds: [])
+        }
+
+        let jsonText = String(resultText[start...end])
+        guard let data = jsonText.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return AskResult(answer: resultText.trimmingCharacters(in: .whitespacesAndNewlines), sessionIds: [])
+        }
+
+        let answer = (object["answer"] as? String) ?? ""
+        var ids: [String] = []
+        if let sessions = object["sessions"] as? [[String: Any]] {
+            for session in sessions {
+                if let id = session["id"] as? String, !id.isEmpty { ids.append(id) }
+            }
+        }
+        guard !answer.isEmpty || !ids.isEmpty else { return nil }
+        return AskResult(answer: answer, sessionIds: ids)
+    }
+
+    /// Runs the agent off the main thread and gives up after the timeout so a hung call can
+    /// never freeze the panel.
+    private static func runCommand(executablePath: String, arguments: [String]) async -> String? {
+        let limit = timeoutSeconds
+        return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: executablePath)
                 process.arguments = arguments
                 process.currentDirectoryURL = scratchDirectory
                 process.standardError = FileHandle.nullDevice
-
-                // Without this, Haiku writes a 2,000-3,000 character reasoning block before
-                // answering, which is most of the wait. Measured on the same ranking:
-                // 9.7s and 16.9s with thinking on, 2.9s and 3.8s with it off, same top answer.
-                // MAX_THINKING_TOKENS is read from the environment, not from a flag, and the
-                // widget inherits CLAUDE_EFFORT=high from whatever shell launched it.
-                var environment = ProcessInfo.processInfo.environment
-                environment["MAX_THINKING_TOKENS"] = "0"
-                environment["CLAUDE_EFFORT"] = "low"
-                process.environment = environment
 
                 let pipe = Pipe()
                 process.standardOutput = pipe
@@ -590,7 +678,7 @@ enum HaikuRerank {
                 let deadline = DispatchWorkItem {
                     if process.isRunning { process.terminate() }
                 }
-                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: deadline)
+                DispatchQueue.global().asyncAfter(deadline: .now() + limit, execute: deadline)
 
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
@@ -604,32 +692,8 @@ enum HaikuRerank {
             }
         }
     }
-
-    /// Pulls the numbers out of the reply, ignoring anything else the model wrote.
-    private static func parseOrder(_ reply: String, candidateCount: Int) -> [Int] {
-        var seen = Set<Int>()
-        var order: [Int] = []
-        var digits = ""
-
-        func flush() {
-            defer { digits = "" }
-            guard let value = Int(digits) else { return }
-            let position = value - 1
-            guard position >= 0, position < candidateCount, seen.insert(position).inserted else { return }
-            order.append(position)
-        }
-
-        for character in reply {
-            if character.isNumber {
-                digits.append(character)
-            } else {
-                flush()
-            }
-        }
-        flush()
-        return order
-    }
 }
+
 // MARK: - Logging
 
 enum SearchLog {

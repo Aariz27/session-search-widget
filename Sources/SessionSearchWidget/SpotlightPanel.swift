@@ -63,14 +63,14 @@ enum SearchMode {
     /// Matches the words you typed against the text of every session. Runs on this
     /// machine, costs nothing, returns in under a tenth of a second.
     case local
-    /// Sends the shortlist to Claude Haiku to be reordered by meaning. Bills your
-    /// Claude subscription and takes several seconds.
+    /// Hands your question to Claude Haiku, which greps every transcript on the machine
+    /// and writes an answer. Bills your Claude subscription and takes 30-60 seconds.
     case semantic
 
     var label: String {
         switch self {
         case .local: return "Local"
-        case .semantic: return "Semantic"
+        case .semantic: return "Ask"
         }
     }
 
@@ -224,6 +224,9 @@ final class SpotlightController: NSObject {
     private let divider = TopDownView()
     private let sectionHeaderView = TopDownView()
     private let sectionHeaderLabel = NSTextField(labelWithString: "")
+    /// The sentence Ask mode writes back. Empty in local search.
+    private let answerLabel = NSTextField(wrappingLabelWithString: "")
+    private var answer: String?
     private let scrollView = NSScrollView()
     private let tableView = NSTableView()
     private let footerView = TopDownView()
@@ -328,6 +331,14 @@ final class SpotlightController: NSObject {
         } else {
             progressIndicator.stopAnimation(nil)
         }
+    }
+
+    /// Shows the sentence Ask mode wrote, or clears it when passed nil.
+    func setAnswer(_ text: String?) {
+        answer = text
+        answerLabel.stringValue = text ?? ""
+        layoutContent()
+        resizeWindow(animated: true)
     }
 
     func setStatus(_ text: String) {
@@ -616,6 +627,12 @@ final class SpotlightController: NSObject {
         backgroundView.addSubview(tintOverlayView)
         backgroundView.addSubview(searchRow)
         backgroundView.addSubview(divider)
+        answerLabel.font = .systemFont(ofSize: 13)
+        answerLabel.textColor = NSColor(white: 0.82, alpha: 1)
+        answerLabel.drawsBackground = false
+        answerLabel.isSelectable = true
+        answerLabel.isHidden = true
+        backgroundView.addSubview(answerLabel)
         backgroundView.addSubview(sectionHeaderView)
         backgroundView.addSubview(scrollView)
         backgroundView.addSubview(footerView)
@@ -623,26 +640,47 @@ final class SpotlightController: NSObject {
 
     // MARK: Layout
 
+    /// Height the answer paragraph needs, or zero when there is no answer to show.
+    private func answerHeight() -> CGFloat {
+        guard let answer, !answer.isEmpty else { return 0 }
+        let width = panelWidth - 32
+        let bounding = (answer as NSString).boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: answerLabel.font ?? NSFont.systemFont(ofSize: 13)]
+        )
+        // Cap it so a long answer scrolls the list off screen instead of filling the display.
+        return min(ceil(bounding.height), 150) + 20
+    }
+
     private func computeHeight() -> CGFloat {
-        guard !rows.isEmpty else { return searchRowHeight }
+        let answerArea = answerHeight()
+        guard !rows.isEmpty else {
+            return answerArea > 0 ? searchRowHeight + hairlineThickness + answerArea : searchRowHeight
+        }
         let visibleRowCount = min(rows.count, maxVisibleRows)
-        return searchRowHeight + hairlineThickness + sectionHeaderHeight
+        return searchRowHeight + hairlineThickness + answerArea + sectionHeaderHeight
             + listVerticalPadding + CGFloat(visibleRowCount) * tableRowHeight + listVerticalPadding
             + footerHeight
     }
 
     private func layoutContent() {
         let hasRows = !rows.isEmpty
-        divider.isHidden = !hasRows
+        let answerArea = answerHeight()
+        divider.isHidden = !hasRows && answerArea == 0
         sectionHeaderView.isHidden = !hasRows
         footerView.isHidden = !hasRows
+        answerLabel.isHidden = answerArea == 0
 
         let visibleRowCount = min(rows.count, maxVisibleRows)
         let tableAreaHeight = hasRows ? CGFloat(visibleRowCount) * tableRowHeight : 0
 
         var y = searchRowHeight
         divider.frame = NSRect(x: 0, y: y, width: panelWidth, height: hairlineThickness)
-        if hasRows { y += hairlineThickness }
+        if hasRows || answerArea > 0 { y += hairlineThickness }
+
+        answerLabel.frame = NSRect(x: 16, y: y + 10, width: panelWidth - 32, height: max(0, answerArea - 20))
+        y += answerArea
 
         sectionHeaderView.frame = NSRect(x: 0, y: y, width: panelWidth, height: hasRows ? sectionHeaderHeight : 0)
         if hasRows { y += sectionHeaderHeight + listVerticalPadding }

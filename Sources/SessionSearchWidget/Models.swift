@@ -47,7 +47,9 @@ struct CachedTranscript: Codable {
 
 struct ScoredEntry {
     let entry: IndexEntry
-    let score: Int
+    /// Sum of the weights of the query words this session matched. A word that appears in
+    /// only one or two sessions is worth far more than one that appears in most of them.
+    let score: Double
 }
 
 // MARK: - What the panel renders, one per visible row
