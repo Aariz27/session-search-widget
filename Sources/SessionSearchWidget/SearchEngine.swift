@@ -55,6 +55,9 @@ enum SessionIndex {
         return transcripts.map { transcript in
             var title = transcript.title
             var textParts = [title, transcript.text]
+            // Only a name you set with /rename can be handed to `claude --resume`; Claude's
+            // own auto-title is not something it will look up.
+            var resumeName: String? = transcript.customTitle.isEmpty ? nil : transcript.customTitle
 
             // A hook summary, when one exists, is the most accurate description of the
             // session, so its name wins and its bullets get added to the searchable text.
@@ -62,6 +65,8 @@ enum SessionIndex {
                 if let name = summary.session_name, !name.isEmpty {
                     title = name
                     textParts.insert(name, at: 0)
+                    // The hook copies the /rename name here, so it is safe to resume by it.
+                    if resumeName == nil { resumeName = name }
                 }
                 for entry in summary.session_summary {
                     textParts.append(contentsOf: entry.bullets)
@@ -71,6 +76,7 @@ enum SessionIndex {
             return IndexEntry(
                 sessionId: transcript.sessionId,
                 sessionName: title,
+                resumeName: resumeName,
                 cwd: transcript.cwd,
                 startedAt: transcript.startedAt,
                 text: textParts.joined(separator: " ").lowercased()
@@ -144,9 +150,11 @@ enum SessionIndex {
             let newest = group.max { $0.modifiedAt < $1.modifiedAt }!
             for member in group { aliases[member.sessionId] = newest.sessionId }
 
-            // A real title Claude wrote beats a fallback built from your opening words.
+            // A name you set with /rename wins over Claude's auto-title, which in turn beats
+            // a fallback built from your opening words.
+            let renamed = group.first { !$0.customTitle.isEmpty }
             let titled = group.first { $0.hasAiTitle }
-            let title = titled?.title ?? newest.title
+            let title = renamed?.customTitle ?? titled?.title ?? newest.title
 
             // The conversation began when its earliest file began.
             let earliestStart = group.compactMap { $0.startedAt.isEmpty ? nil : $0.startedAt }.min() ?? newest.startedAt
@@ -170,6 +178,7 @@ enum SessionIndex {
                 byteSize: newest.byteSize,
                 title: title,
                 hasAiTitle: titled != nil,
+                customTitle: renamed?.customTitle ?? "",
                 cwd: newest.cwd,
                 startedAt: earliestStart,
                 text: String(combined.prefix(maxTextPerSession)),
@@ -257,6 +266,7 @@ enum SessionIndex {
         guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return nil }
 
         var aiTitle = ""
+        var customTitle = ""
         var cwd = ""
         var startedAt = ""
         var typedText = ""
@@ -269,6 +279,13 @@ enum SessionIndex {
 
             if type == "ai-title", let value = object["aiTitle"] as? String, !value.isEmpty {
                 aiTitle = value
+                continue
+            }
+
+            // /rename (and the -n flag) write this. Renaming twice writes two records, so the
+            // last one seen is the one that counts.
+            if type == "custom-title", let value = object["customTitle"] as? String, !value.isEmpty {
+                customTitle = value
                 continue
             }
 
@@ -303,7 +320,15 @@ enum SessionIndex {
             cwd = FileManager.default.homeDirectoryForCurrentUser.path
         }
 
-        let title = aiTitle.isEmpty ? firstLineTitle(from: typedText) : aiTitle
+        // A name you typed yourself is the best label there is, so it beats Claude's guess.
+        let title: String
+        if !customTitle.isEmpty {
+            title = customTitle
+        } else if !aiTitle.isEmpty {
+            title = aiTitle
+        } else {
+            title = firstLineTitle(from: typedText)
+        }
 
         return CachedTranscript(
             sessionId: sessionId,
@@ -312,6 +337,7 @@ enum SessionIndex {
             byteSize: byteSize,
             title: title,
             hasAiTitle: !aiTitle.isEmpty,
+            customTitle: customTitle,
             cwd: cwd,
             startedAt: startedAt,
             text: String(typedText.prefix(maxTextPerSession)),
@@ -441,9 +467,14 @@ enum SessionSearch {
             let entry = scoredEntry.entry
             let projectName = (entry.cwd as NSString).lastPathComponent
             let snippet = makeSnippet(text: entry.text, tokens: tokens)
-            // Resume by session id, not by name: most transcripts have no hook-written
-            // name, and `claude --resume` takes the id directly.
-            let command = "claude --resume \(entry.sessionId)"
+            // `claude --resume` takes a name as well as an id, and a name you chose is far
+            // easier to read in a terminal than a UUID. Sessions you never renamed keep the id.
+            let command: String
+            if let name = entry.resumeName, !name.isEmpty {
+                command = "claude --resume \"\(name)\""
+            } else {
+                command = "claude --resume \(entry.sessionId)"
+            }
             return SearchResultRow(
                 sessionId: entry.sessionId,
                 sessionName: entry.sessionName,

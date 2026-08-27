@@ -19,8 +19,11 @@ struct SessionRecord: Codable {
 
 struct IndexEntry {
     let sessionId: String
-    /// Claude's own auto-title, else the hook-written name, else the first thing you typed.
+    /// The name you gave with /rename, else Claude's auto-title, else the first thing you typed.
     let sessionName: String
+    /// Set only when you renamed the session. `claude --resume` accepts a name as well as an
+    /// id, so this is what the opened Terminal command uses when it exists.
+    let resumeName: String?
     let cwd: String
     let startedAt: String
     /// Lowercased title + everything you typed in that session + any hook summary bullets.
@@ -37,6 +40,9 @@ struct CachedTranscript: Codable {
     let title: String
     /// True when Claude wrote the title itself, false when it fell back to your opening words.
     let hasAiTitle: Bool
+    /// The name you gave the session with /rename, or with the -n flag at launch. Both write
+    /// a `custom-title` record into the transcript. Empty when you never renamed it.
+    let customTitle: String
     let cwd: String
     let startedAt: String
     let text: String
