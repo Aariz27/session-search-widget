@@ -3,3 +3,8 @@
 *.jsonl
 sessions.json
 .sessions-state.json
+*.bak
+*.bak-*
+*.pre-rename
+.sessions-state.json.lock
+sessions.json.lock
