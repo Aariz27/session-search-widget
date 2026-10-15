@@ -32,7 +32,7 @@ your session history does not end up in your repos.
 ## Install
 
 ```bash
-git clone <this-repo-url> session-search-widget
+git clone https://github.com/Aariz27/session-search-widget.git
 cd session-search-widget
 ./install.sh
 ```
